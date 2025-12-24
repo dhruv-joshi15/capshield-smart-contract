@@ -28,3 +28,10 @@ dist-ssr
 old.js
 tmp
 temp.js
+
+# Hardhat / Solidity build outputs
+artifacts/
+cache/
+coverage/
+coverage.json
+typechain/
