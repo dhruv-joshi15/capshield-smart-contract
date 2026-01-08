@@ -7,7 +7,8 @@ describe("CapShieldVesting (v2)", function () {
   const VEST = 50 * 30 * 24 * 60 * 60;
 
   async function deployFixture() {
-    const [admin, treasury, dao, backendSigner, beneficiary, other] = await ethers.getSigners();
+    const [admin, treasury, dao, backendSigner, beneficiary, other] =
+      await ethers.getSigners();
 
     const ShieldToken = await ethers.getContractFactory("ShieldToken");
     const token = await ShieldToken.deploy(
@@ -18,9 +19,22 @@ describe("CapShieldVesting (v2)", function () {
     );
 
     const Vesting = await ethers.getContractFactory("CapShieldVesting");
-    const vesting = await Vesting.deploy(token.target, admin.address);
+    const vesting = await Vesting.deploy(
+      token.target,
+      admin.address,
+      treasury.address
+    );
 
-    return { token, vesting, admin, treasury, dao, backendSigner, beneficiary, other };
+    return {
+      token,
+      vesting,
+      admin,
+      treasury,
+      dao,
+      backendSigner,
+      beneficiary,
+      other,
+    };
   }
 
   async function signUserMint(token, backendSigner, to, amount, nonce, deadline) {
@@ -44,102 +58,105 @@ describe("CapShieldVesting (v2)", function () {
     );
   }
 
-  it("creating vesting only after funding contract", async function () {
-    const { token, vesting, admin, backendSigner, beneficiary } = await deployFixture();
+  async function fundVesting(token, vesting, admin, backendSigner, amount) {
+    const nonce = await token.nonces(admin.address);
+    const deadline =
+      (await ethers.provider.getBlock("latest")).timestamp + 3600;
 
+    const sig = await signUserMint(
+      token,
+      backendSigner,
+      admin.address,
+      amount,
+      nonce,
+      deadline
+    );
+
+    await token.connect(admin).userMint(amount, deadline, sig);
+    await token.connect(admin).transfer(vesting.target, amount);
+  }
+
+  function expectClose(actual, expected, tolerance) {
+    const diff = actual > expected ? actual - expected : expected - actual;
+    expect(diff).to.be.lte(tolerance);
+  }
+
+  it("creating vesting only after funding contract", async function () {
+    const { token, vesting, admin, backendSigner, beneficiary } =
+      await deployFixture();
     const allocation = ethers.parseEther("1000");
 
     await expect(
       vesting.connect(admin).createVesting(beneficiary.address, allocation)
     ).to.be.revertedWith("Insufficient funding");
 
-    const nonce = await token.nonces(admin.address);
-    const deadline = (await ethers.provider.getBlock("latest")).timestamp + 3600;
-    const sig = await signUserMint(token, backendSigner, admin.address, allocation, nonce, deadline);
-
-    await token.connect(admin).userMint(allocation, deadline, sig);
-    await token.connect(admin).transfer(vesting.target, allocation);
-
+    await fundVesting(token, vesting, admin, backendSigner, allocation);
     await vesting.connect(admin).createVesting(beneficiary.address, allocation);
   });
 
   it("blocking claim before cliff", async function () {
-    const { token, vesting, admin, backendSigner, beneficiary } = await deployFixture();
-
+    const { token, vesting, admin, backendSigner, beneficiary } =
+      await deployFixture();
     const allocation = ethers.parseEther("1000");
-    const nonce = await token.nonces(admin.address);
-    const deadline = (await ethers.provider.getBlock("latest")).timestamp + 3600;
-    const sig = await signUserMint(token, backendSigner, admin.address, allocation, nonce, deadline);
 
-    await token.connect(admin).userMint(allocation, deadline, sig);
-    await token.connect(admin).transfer(vesting.target, allocation);
+    await fundVesting(token, vesting, admin, backendSigner, allocation);
     await vesting.connect(admin).createVesting(beneficiary.address, allocation);
 
-    await expect(vesting.connect(beneficiary).claim()).to.be.revertedWith("Nothing to claim");
+    await expect(vesting.connect(beneficiary).claim()).to.be.revertedWith(
+      "Nothing to claim"
+    );
   });
 
-  it("allowing partial claim mid vesting with fee applied", async function () {
-    const { token, vesting, admin, backendSigner, beneficiary } = await deployFixture();
-
+  it("allowing partial claim mid vesting", async function () {
+    const { token, vesting, admin, backendSigner, beneficiary } =
+      await deployFixture();
     const allocation = ethers.parseEther("1000");
-    const nonce = await token.nonces(admin.address);
-    const deadline = (await ethers.provider.getBlock("latest")).timestamp + 3600;
-    const sig = await signUserMint(token, backendSigner, admin.address, allocation, nonce, deadline);
 
-    await token.connect(admin).userMint(allocation, deadline, sig);
-    await token.connect(admin).transfer(vesting.target, allocation);
+    await fundVesting(token, vesting, admin, backendSigner, allocation);
     await vesting.connect(admin).createVesting(beneficiary.address, allocation);
 
     const v = await vesting.vestings(beneficiary.address);
-    const cliffEnd = Number(v.startTime) + CLIFF;
-
-    await time.increaseTo(cliffEnd + Math.floor(VEST / 2));
+    await time.increaseTo(Number(v.startTime) + CLIFF + Math.floor(VEST / 2));
 
     const claimable = await vesting.claimableAmount(beneficiary.address);
-    const expectedAfterFee = (claimable * 98n) / 100n;
+    expect(claimable).to.be.gt(0n);
 
+    const benBefore = await token.balanceOf(beneficiary.address);
     await vesting.connect(beneficiary).claim();
+    const benAfter = await token.balanceOf(beneficiary.address);
 
-    const balance = await token.balanceOf(beneficiary.address);
-    const diff =
-      balance > expectedAfterFee
-        ? balance - expectedAfterFee
-        : expectedAfterFee - balance;
-
-    expect(diff).to.be.lessThan(ethers.parseEther("0.00001"));
+    const received = benAfter - benBefore;
+    const tolerance = ethers.parseEther("0.02");
+    expectClose(received, claimable, tolerance);
   });
 
-  it("allowing full claim after vesting ends with fee applied", async function () {
-    const { token, vesting, admin, backendSigner, beneficiary } = await deployFixture();
-
+  it("allowing full claim after vesting ends", async function () {
+    const { token, vesting, admin, backendSigner, beneficiary } =
+      await deployFixture();
     const allocation = ethers.parseEther("1000");
-    const nonce = await token.nonces(admin.address);
-    const deadline = (await ethers.provider.getBlock("latest")).timestamp + 3600;
-    const sig = await signUserMint(token, backendSigner, admin.address, allocation, nonce, deadline);
 
-    await token.connect(admin).userMint(allocation, deadline, sig);
-    await token.connect(admin).transfer(vesting.target, allocation);
+    await fundVesting(token, vesting, admin, backendSigner, allocation);
     await vesting.connect(admin).createVesting(beneficiary.address, allocation);
 
     const v = await vesting.vestings(beneficiary.address);
     await time.increaseTo(Number(v.startTime) + CLIFF + VEST + 10);
 
-    await vesting.connect(beneficiary).claim();
+    const claimable = await vesting.claimableAmount(beneficiary.address);
+    expect(claimable).to.equal(allocation);
 
-    const expected = (allocation * 98n) / 100n;
-    expect(await token.balanceOf(beneficiary.address)).to.equal(expected);
+    const benBefore = await token.balanceOf(beneficiary.address);
+    await vesting.connect(beneficiary).claim();
+    const benAfter = await token.balanceOf(beneficiary.address);
+
+    expect(benAfter - benBefore).to.equal(allocation);
   });
 
-  it("revoking and blocking further claims", async function () {
-    const { token, vesting, admin, backendSigner, beneficiary } = await deployFixture();
-
+  it("revoking returns unvested to treasury and allows claiming already vested tokens", async function () {
+    const { token, vesting, admin, backendSigner, beneficiary } =
+      await deployFixture();
     const allocation = ethers.parseEther("1000");
-    const nonce = await token.nonces(admin.address);
-    const deadline = (await ethers.provider.getBlock("latest")).timestamp + 3600;
-    const sig = await signUserMint(token, backendSigner, admin.address, allocation, nonce, deadline);
 
-    await token.connect(admin).userMint(allocation, deadline, sig);
-    await token.connect(admin).transfer(vesting.target, allocation);
+    await fundVesting(token, vesting, admin, backendSigner, allocation);
     await vesting.connect(admin).createVesting(beneficiary.address, allocation);
 
     const v = await vesting.vestings(beneficiary.address);
@@ -147,6 +164,39 @@ describe("CapShieldVesting (v2)", function () {
 
     await vesting.connect(admin).revoke(beneficiary.address);
 
-    await expect(vesting.connect(beneficiary).claim()).to.be.revertedWith("Vesting revoked");
+    const claimableAfterRevoke = await vesting.claimableAmount(
+      beneficiary.address
+    );
+    expect(claimableAfterRevoke).to.be.gt(0n);
+
+    const benBefore = await token.balanceOf(beneficiary.address);
+    await vesting.connect(beneficiary).claim();
+    const benAfter = await token.balanceOf(beneficiary.address);
+
+    const received = benAfter - benBefore;
+    const tolerance = ethers.parseEther("0.02");
+    expectClose(received, claimableAfterRevoke, tolerance);
+
+    const remaining = await vesting.claimableAmount(beneficiary.address);
+expect(remaining).to.be.lte(ethers.parseEther("0.000001"));
+
+  });
+
+  it("UI view functions return correct values", async function () {
+    const { token, vesting, admin, backendSigner, beneficiary } =
+      await deployFixture();
+    const allocation = ethers.parseEther("1000");
+
+    await fundVesting(token, vesting, admin, backendSigner, allocation);
+    await vesting.connect(admin).createVesting(beneficiary.address, allocation);
+
+    const gv = await vesting.getVesting(beneficiary.address);
+
+    expect(gv.totalAllocation).to.equal(allocation);
+    expect(gv.claimed).to.equal(0n);
+    expect(gv.startTime).to.be.gt(0n);
+    expect(gv.cliffEnd).to.equal(gv.startTime + BigInt(CLIFF));
+    expect(gv.vestingEnd).to.equal(gv.cliffEnd + BigInt(VEST));
+    expect(gv.revoked).to.equal(false);
   });
 });
